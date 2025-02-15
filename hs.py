@@ -1,6 +1,6 @@
 import os
 from openai import OpenAI
-from langchain_openai import ChatOpenAI
+from hs import ChatOpenAI
 
 llm = ChatOpenAI(
     openai_api_base="https://ark.cn-beijing.volces.com/api/v3",

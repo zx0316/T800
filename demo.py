@@ -12,9 +12,13 @@ import json
 from vosk import Model, KaldiRecognizer
 import numpy as np
 import pyttsx3
+import threading
 
 # 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
+)
 
 # 检查环境变量是否已设置
 required_env_vars = ['OSS_ACCESS_KEY_ID', 'OSS_ACCESS_KEY_SECRET', 'DASHSCOPE_API_KEY']
@@ -61,21 +65,54 @@ def upload_file(bucket, object_name, data):
         logging.error(f"Failed to upload file: {e}")
         return None
 
-def call_large_model(image_url, audio_text):
+# 定义对话历史列表
+conversation_history = []
+# 定义存储最近 2 次图片 URL 的列表
+recent_image_urls = []
+
+# 定义最大历史对话数量
+MAX_CONVERSATION_HISTORY = 5
+
+def call_large_model(image_urls, audio_text):
+    global conversation_history
     client = OpenAI(
         api_key=os.getenv("DASHSCOPE_API_KEY"),
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
     )
     try:
+        # 构建当前用户消息
+        content = [{"type": "text", "text": f"'{audio_text}'"}]
+        for url in image_urls:
+            content.append({"type": "image_url", "image_url": {"url": url}})
+        user_message = {
+            "role": "user",
+            "content": content
+        }
+        # 将当前用户消息添加到对话历史中
+        conversation_history.append(user_message)
+
+        # 检查对话历史长度，若超过 5 条则移除最早的记录
+        if len(conversation_history) > MAX_CONVERSATION_HISTORY:
+            conversation_history.pop(0)
+
         completion = client.chat.completions.create(
             model="qwen-vl-plus",
-            messages=[{"role": "user", "content": [
-                {"type": "text", "text": f"'{audio_text}'"},
-                {"type": "image_url", "image_url": {"url": image_url}}
-            ]}]
+            messages=conversation_history
         )
         response_text = completion.choices[0].message.content.strip()
         print(response_text)
+
+        # 将模型回复添加到对话历史中
+        assistant_message = {
+            "role": "assistant",
+            "content": response_text
+        }
+        conversation_history.append(assistant_message)
+
+        # 再次检查对话历史长度，若超过 5 条则移除最早的记录
+        if len(conversation_history) > MAX_CONVERSATION_HISTORY:
+            conversation_history.pop(0)
+
         return response_text
     except Exception as e:
         logging.error(f"Failed to call large model: {e}")
@@ -162,16 +199,34 @@ def audio_to_text_with_vosk(audio_data, model_path):
     return result_dict.get("text", "").strip()
 
 def text_to_speech(text):
+    # 初始化 pyttsx3 引擎
     engine = pyttsx3.init()
-    engine.setProperty('rate', 150)  # 设置语速
+    engine.setProperty('rate', 200)  # 设置语速
     engine.setProperty('volume', 1.0)  # 设置音量
-    voices = engine.getProperty('voices')
-    for voice in voices:
-        if "zh" in voice.languages[0]:  # 选择中文语音
-            engine.setProperty('voice', voice.id)
-            break
     engine.say(text)
     engine.runAndWait()
+    logging.info("Text-to-speech completed")
+
+def capture_images(cap, stop_event):
+    global recent_image_urls
+    last_capture_time = time.time()
+    while not stop_event.is_set():
+        current_time = time.time()
+        if current_time - last_capture_time >= 10:  # 每隔 500ms 抓一张图片
+            ret, frame = cap.read()
+            if ret:
+                # 将图像编码为 JPEG 格式
+                _, buffer = cv2.imencode('.jpeg', frame)
+                # 生成唯一的对象名称
+                image_object_name = f"image_{int(time.time() * 1000)}.jpeg"
+                # 上传图像文件并获取 URL
+                image_url = upload_file(bucket, image_object_name, buffer.tobytes())
+                if image_url:
+                    recent_image_urls.append(image_url)
+                    if len(recent_image_urls) > 2:
+                        recent_image_urls.pop(0)  # 只保留最近 2 次的图片 URL
+            last_capture_time = current_time
+        time.sleep(1)
 
 # 主流程
 if __name__ == '__main__':
@@ -190,34 +245,20 @@ if __name__ == '__main__':
     model_path = "/Users/hobby/.cache/vosk/vosk-model-small-cn-0.22"  # 替换为您的模型路径
 
     try:
+        stop_event = threading.Event()
+        # 启动图像捕获线程
+        image_thread = threading.Thread(target=capture_images, args=(cap, stop_event))
+        image_thread.start()
+
         while True:
             # 捕获音频
             audio_data = capture_audio_with_vosk(model_path)
-
             # 音频转文字
             audio_text = audio_to_text_with_vosk(audio_data, model_path)
 
-            # 读取一帧图像
-            ret, frame = cap.read()
-
-            # 检查图像读取是否成功
-            if not ret:
-                print("无法读取图像")
-                break
-
-            # 将图像编码为 JPEG 格式
-            _, buffer = cv2.imencode('.jpeg', frame)
-
-            # 生成唯一的对象名称
-            image_object_name = f"image_{int(time.time() * 1000)}.jpeg"
-
-            # 上传图像文件并获取 URL
-            image_url = upload_file(bucket, image_object_name, buffer.tobytes())
-            print(image_url)
-
-            if image_url and audio_text:
+            if audio_text and recent_image_urls:
                 # 调用大模型进行分析
-                response_text = call_large_model(image_url, audio_text)
+                response_text = call_large_model(recent_image_urls, audio_text)
 
                 if response_text:
                     # 文本转语音并播放
@@ -225,9 +266,9 @@ if __name__ == '__main__':
 
     except KeyboardInterrupt:
         logging.info("Program interrupted by user.")
+        stop_event.set()
     finally:
         # 释放摄像头资源
         cap.release()
         # 关闭所有打开的窗口
         cv2.destroyAllWindows()
-
